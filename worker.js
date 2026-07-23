@@ -79,22 +79,111 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    /* MYOB Business (AccountRight/Essentials browser product). Verified against
+       MYOB's post-March-2025 OAuth guide at build time (secure.myob.com endpoints,
+       sme- scopes, prompt=consent, businessId returned on the redirect). Re-check
+       developer.myob.com before relying on this long-term - MYOB changes this. */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://secure.myob.com/oauth2/account/authorize',
+      tokenUrl: 'https://secure.myob.com/oauth2/v1/authorize',
+      scopes: 'sme-company-file sme-general-ledger',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'post',
+      /* MYOB requires this to get businessId back on the redirect (the kit's
+         generic authStart appends these on top of the standard params). */
+      extraAuthParams: { prompt: 'consent' }
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    /* ---- MYOB-specific helpers ---- */
+    async _accounts(env, h, tokens) {
+      /* Classification per account UID, cached a day (chart of accounts rarely
+         changes intraday). Classification: Income | CostOfSales | Expense | ... */
+      const cacheKey = 'myob:accounts:' + tokens.businessId;
+      const cached = env.TOKENS && await env.TOKENS.get(cacheKey);
+      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+      const base = 'https://api.myob.com/accountright/' + tokens.businessId;
+      let list = [], nextUrl = base + '/GeneralLedger/Account?$top=400';
+      for (let guard = 0; guard < 10 && nextUrl; guard++) {
+        const page = await h.fetchJson(nextUrl);
+        list = list.concat(page.Items || []);
+        nextUrl = page.NextPageLink || null;
+      }
+      const map = {};
+      for (const a of list) {
+        map[a.UID] = { classification: a.Classification, name: a.Name || '', displayId: a.DisplayID || '' };
+      }
+      if (env.TOKENS) await env.TOKENS.put(cacheKey, JSON.stringify(map), { expirationTtl: 86400 });
+      return map;
+    },
+
+    /* Sums the ledger for one date range (inclusive) into the four P&L buckets.
+       Every figure here is naturally ex-GST: MYOB posts GST to a separate
+       liability account, never mixed into Income/Cost of Sales/Expense lines. */
+    async _sumRange(env, h, tokens, accounts, from, to) {
+      const base = 'https://api.myob.com/accountright/' + tokens.businessId;
+      const fromIso = from + 'T00:00:00';
+      const toIso = to + 'T23:59:59';
+      const filter = encodeURIComponent("DateOccurred ge datetime'" + fromIso + "' and DateOccurred le datetime'" + toIso + "'");
+      let nextUrl = base + '/GeneralLedger/JournalTransaction?$filter=' + filter + '&$top=400';
+      const out = { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
+      const wageWords = /(wage|salary|salaries|super|superannuation)/i;
+      for (let guard = 0; guard < 60 && nextUrl; guard++) {
+        const page = await h.fetchJson(nextUrl);
+        for (const tx of (page.Items || [])) {
+          for (const line of (tx.Lines || [])) {
+            const acc = line.Account && accounts[line.Account.UID];
+            if (!acc) continue;
+            /* Credits increase Income; debits increase Cost of Sales/Expense.
+               MYOB lines carry IsCredit + Amount (always positive). */
+            const signed = line.IsCredit ? line.Amount : -line.Amount;
+            if (acc.classification === 'Income') out.revenue += signed;
+            else if (acc.classification === 'CostOfSales') out.cogs += -signed;
+            else if (acc.classification === 'Expense') {
+              const bucket = wageWords.test(acc.name) ? 'wagesSuper' : 'overheads';
+              out[bucket] += -signed;
+            }
+          }
+        }
+        nextUrl = page.NextPageLink || null;
+      }
+      return out;
+    },
+
+    async status(env, h) {
+      let tokens;
+      try { tokens = await h.getTokens(); } catch (e) { tokens = null; }
+      if (!tokens || !tokens.access_token || !tokens.businessId) return { connected: false };
+      const name = tokens.businessName || '';
+      return {
+        connected: true,
+        org: name,
+        sandbox: /demo|sandbox|test company/i.test(name),
+        lastSync: (await h.getTokens()).lastFetched || null
+      };
+    },
+    async fetchRange(env, h, q) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.businessId) throw new NotConfigured('accounting');
+      const accounts = await this._accounts(env, h, tokens);
+      return await this._sumRange(env, h, tokens, accounts, q.from, q.to);
+    },
+    async fetchMonthly(env, h, q) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.businessId) throw new NotConfigured('accounting');
+      const accounts = await this._accounts(env, h, tokens);
+      const months = monthList(q.fromMonth, q.toMonth);
+      const revenue = [], cogs = [], wagesSuper = [], overheads = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const r = await this._sumRange(env, h, tokens, accounts, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
+        revenue.push(r.revenue); cogs.push(r.cogs); wagesSuper.push(r.wagesSuper); overheads.push(r.overheads);
+      }
+      return { months, revenue, cogs, wagesSuper, overheads };
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -451,6 +540,7 @@ async function authStart(env, source, url) {
     scope: cfg.scopes || '',
     state
   });
+  for (const [k, v] of Object.entries(cfg.extraAuthParams || {})) p.set(k, v);
   return Response.redirect(cfg.authorizeUrl + '?' + p.toString(), 302);
 }
 
@@ -474,12 +564,20 @@ async function authCallback(env, source, url) {
     return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn’t match exactly.', { status: 502 });
   }
   const t = await res.json();
+  /* Some providers (MYOB) return extra identifiers on the redirect itself -
+     e.g. businessId/businessName selecting which company file was authorised. */
+  const extra = {};
+  for (const k of ['businessId', 'businessName']) {
+    const v = url.searchParams.get(k);
+    if (v) extra[k] = v;
+  }
   await saveTokens(env, source, {
     access_token: t.access_token,
     refresh_token: t.refresh_token || null,
     token_type: t.token_type || 'Bearer',
     expires_at: Date.now() + ((t.expires_in || 1800) * 1000),
-    obtained_at: new Date().toISOString()
+    obtained_at: new Date().toISOString(),
+    ...extra
   });
   /* After token storage, adapters' status() should resolve org name etc. */
   return Response.redirect(url.origin + '/', 302);
