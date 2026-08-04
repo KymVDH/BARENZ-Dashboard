@@ -123,29 +123,56 @@ const ADAPTERS = {
        the owner exports the exact period they want the dashboard to show
        (this week/month/etc) and uploads it fresh each time for that period. */
     parseExport(env, h, raw) {
+      /* Minimal CSV line splitter that respects quoted fields, since MYOB's
+         own export puts thousands-separator commas INSIDE quoted amounts
+         (e.g. "$34,579.76") - a naive split(',') breaks on those. */
+      function splitCsvLine(line) {
+        const cells = [];
+        let cur = '', inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const c = line[i];
+          if (c === '"') { inQuotes = !inQuotes; continue; }
+          if (c === ',' && !inQuotes) { cells.push(cur); cur = ''; continue; }
+          cur += c;
+        }
+        cells.push(cur);
+        return cells.map((c) => c.trim());
+      }
       const lines = String(raw.text || '').split(/\r?\n/);
-      const sectionWords = {
-        income: /^(income|sales|trading income)/i,
-        cos: /^cost of sales/i,
-        expense: /^(expense|expenses|operating expenses)/i,
-        other: /^other (income|expense)/i
+      /* Section headers are their own line with NO amount (e.g. a bare
+         "Income" row followed by indented items like "Sales- General").
+         Must match the WHOLE label, not just a prefix - "Sales- General"
+         starts with "Sales" too and is a data row, not a new header. */
+      const headerWords = {
+        income: /^income$/i,
+        cos: /^cost of sales$/i,
+        expense: /^expenses?$/i,
+        other: /^other (income|expense)s?$/i
       };
+      const skipLine = /^(total\b|gross profit|net profit|operating profit)/i;
       let section = null;
       const totals = { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
       const wageWords = /(wage|salary|salaries|super|superannuation)/i;
       for (const line of lines) {
-        const cells = line.split(',').map((c) => c.replace(/^"|"$/g, '').trim());
+        const cells = splitCsvLine(line);
         if (cells.length < 2) continue;
         const label = cells[0];
-        const amountCell = cells[cells.length - 1].replace(/[^0-9.\-]/g, '');
-        const amount = parseFloat(amountCell);
         if (!label) continue;
-        if (sectionWords.income.test(label)) { section = 'income'; continue; }
-        if (sectionWords.cos.test(label)) { section = 'cos'; continue; }
-        if (sectionWords.expense.test(label)) { section = 'expense'; continue; }
-        if (sectionWords.other.test(label)) { section = null; continue; } /* Other Income/Expense excluded - not trading */
-        if (/^total\b/i.test(label)) continue; /* skip subtotal/total rows */
-        if (!isFinite(amount) || !section) continue;
+        let amountCell = '';
+        for (let i = cells.length - 1; i >= 1; i--) {
+          if (cells[i] !== '') { amountCell = cells[i]; break; }
+        }
+        const amount = parseFloat(amountCell.replace(/[^0-9.\-]/g, ''));
+        const hasAmount = isFinite(amount) && amountCell !== '';
+        if (!hasAmount) {
+          if (headerWords.income.test(label)) { section = 'income'; continue; }
+          if (headerWords.cos.test(label)) { section = 'cos'; continue; }
+          if (headerWords.expense.test(label)) { section = 'expense'; continue; }
+          if (headerWords.other.test(label)) { section = null; continue; } /* Other Income/Expense excluded - not trading */
+          continue; /* some other blank/label-only line */
+        }
+        if (skipLine.test(label)) continue; /* subtotal/Total/Gross Profit/Net Profit rows */
+        if (!section) continue;
         if (section === 'income') totals.revenue += amount;
         else if (section === 'cos') totals.cogs += amount;
         else if (section === 'expense') {
