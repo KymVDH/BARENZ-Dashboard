@@ -79,110 +79,82 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    /* MYOB Business (AccountRight/Essentials browser product). Verified against
-       MYOB's post-March-2025 OAuth guide at build time (secure.myob.com endpoints,
-       sme- scopes, prompt=consent, businessId returned on the redirect). Re-check
-       developer.myob.com before relying on this long-term - MYOB changes this. */
+    /* MYOB Business/AccountRight has a usable live API, but it requires a paid
+       MYOB Developer program tier (from $110/mo) just to get an API key - the
+       owner chose NOT to pay for that. So this uses the FALLBACK LADDER's
+       guided-upload rung instead: the owner exports their Profit & Loss report
+       from MYOB (Reports > Profit and Loss > Send To > Export/CSV) for
+       whichever period they want reflected, and uploads it on the dashboard's
+       Connections screen using the upload code below. Nothing here costs
+       anything. If the owner later decides the live connection is worth the
+       MYOB subscription, revisit this adapter and wire OAuth instead (the
+       kit's authStart/authCallback plumbing already supports MYOB's
+       prompt=consent + businessId flow - see capability-matrix.md). */
     configured: true,
-    auth: 'oauth',
-    oauth: {
-      authorizeUrl: 'https://secure.myob.com/oauth2/account/authorize',
-      tokenUrl: 'https://secure.myob.com/oauth2/v1/authorize',
-      scopes: 'sme-company-file sme-general-ledger',
-      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-      tokenAuth: 'post',
-      /* MYOB requires this to get businessId back on the redirect (the kit's
-         generic authStart appends these on top of the standard params). */
-      extraAuthParams: { prompt: 'consent' }
-    },
-
-    /* ---- MYOB-specific helpers ---- */
-    async _accounts(env, h, tokens) {
-      /* Classification per account UID, cached a day (chart of accounts rarely
-         changes intraday). Classification: Income | CostOfSales | Expense | ... */
-      const cacheKey = 'myob:accounts:' + tokens.businessId;
-      const cached = env.TOKENS && await env.TOKENS.get(cacheKey);
-      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
-      const base = 'https://api.myob.com/accountright/' + tokens.businessId;
-      let list = [], nextUrl = base + '/GeneralLedger/Account?$top=400';
-      for (let guard = 0; guard < 10 && nextUrl; guard++) {
-        const page = await h.fetchJson(nextUrl);
-        list = list.concat(page.Items || []);
-        nextUrl = page.NextPageLink || null;
-      }
-      const map = {};
-      for (const a of list) {
-        map[a.UID] = { classification: a.Classification, name: a.Name || '', displayId: a.DisplayID || '' };
-      }
-      if (env.TOKENS) await env.TOKENS.put(cacheKey, JSON.stringify(map), { expirationTtl: 86400 });
-      return map;
-    },
-
-    /* Sums the ledger for one date range (inclusive) into the four P&L buckets.
-       Every figure here is naturally ex-GST: MYOB posts GST to a separate
-       liability account, never mixed into Income/Cost of Sales/Expense lines. */
-    async _sumRange(env, h, tokens, accounts, from, to) {
-      const base = 'https://api.myob.com/accountright/' + tokens.businessId;
-      const fromIso = from + 'T00:00:00';
-      const toIso = to + 'T23:59:59';
-      const filter = encodeURIComponent("DateOccurred ge datetime'" + fromIso + "' and DateOccurred le datetime'" + toIso + "'");
-      let nextUrl = base + '/GeneralLedger/JournalTransaction?$filter=' + filter + '&$top=400';
-      const out = { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
-      const wageWords = /(wage|salary|salaries|super|superannuation)/i;
-      for (let guard = 0; guard < 60 && nextUrl; guard++) {
-        const page = await h.fetchJson(nextUrl);
-        for (const tx of (page.Items || [])) {
-          for (const line of (tx.Lines || [])) {
-            const acc = line.Account && accounts[line.Account.UID];
-            if (!acc) continue;
-            /* Credits increase Income; debits increase Cost of Sales/Expense.
-               MYOB lines carry IsCredit + Amount (always positive). */
-            const signed = line.IsCredit ? line.Amount : -line.Amount;
-            if (acc.classification === 'Income') out.revenue += signed;
-            else if (acc.classification === 'CostOfSales') out.cogs += -signed;
-            else if (acc.classification === 'Expense') {
-              const bucket = wageWords.test(acc.name) ? 'wagesSuper' : 'overheads';
-              out[bucket] += -signed;
-            }
-          }
-        }
-        nextUrl = page.NextPageLink || null;
-      }
-      return out;
-    },
-
+    auth: null,
+    oauth: {},
     async status(env, h) {
-      let tokens;
-      try { tokens = await h.getTokens(); } catch (e) { tokens = null; }
-      if (!tokens || !tokens.access_token || !tokens.businessId) return { connected: false };
-      const name = tokens.businessName || '';
-      return {
-        connected: true,
-        org: name,
-        sandbox: /demo|sandbox|test company/i.test(name),
-        lastSync: (await h.getTokens()).lastFetched || null
-      };
+      const raw = await (env.TOKENS && env.TOKENS.get('lastSync:accounting'));
+      return { connected: !!raw, org: null, sandbox: false, lastSync: raw || null };
     },
     async fetchRange(env, h, q) {
-      const tokens = await h.getTokens();
-      if (!tokens || !tokens.businessId) throw new NotConfigured('accounting');
-      const accounts = await this._accounts(env, h, tokens);
-      return await this._sumRange(env, h, tokens, accounts, q.from, q.to);
+      const r = await h.readIngested(q.from, q.to);
+      if (!r.daysWithData) throw new NotConfigured('accounting');
+      return {
+        revenue: r.sums.revenue || 0,
+        cogs: r.sums.cogs || 0,
+        wagesSuper: r.sums.wagesSuper || 0,
+        overheads: r.sums.overheads || 0
+      };
     },
     async fetchMonthly(env, h, q) {
-      const tokens = await h.getTokens();
-      if (!tokens || !tokens.businessId) throw new NotConfigured('accounting');
-      const accounts = await this._accounts(env, h, tokens);
-      const months = monthList(q.fromMonth, q.toMonth);
-      const revenue = [], cogs = [], wagesSuper = [], overheads = [];
-      for (const mo of months) {
-        const [y, m] = mo.split('-').map(Number);
-        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-        const r = await this._sumRange(env, h, tokens, accounts, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
-        revenue.push(r.revenue); cogs.push(r.cogs); wagesSuper.push(r.wagesSuper); overheads.push(r.overheads);
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      const pick = (k) => m.byMonth.map((row) => (row ? (row[k] || 0) : null));
+      return { months: m.months, revenue: pick('revenue'), cogs: pick('cogs'), wagesSuper: pick('wagesSuper'), overheads: pick('overheads') };
+    },
+    /* Parses a P&L exported from MYOB AccountRight as CSV. Liberal on format:
+       tracks the current section as it reads down the report (Income / Cost
+       of Sales / Expenses / Other Income / Other Expense), skips "Total ..."
+       subtotal lines (they'd double-count), and splits Expense lines into
+       wagesSuper vs overheads by name (wage/salary/super keywords). Every
+       figure is ex-GST because AccountRight posts GST to its own liability
+       account, never mixed into these classifications.
+       All figures land on the export's own "as at" date (today) as ONE row -
+       the owner exports the exact period they want the dashboard to show
+       (this week/month/etc) and uploads it fresh each time for that period. */
+    parseExport(env, h, raw) {
+      const lines = String(raw.text || '').split(/\r?\n/);
+      const sectionWords = {
+        income: /^(income|sales|trading income)/i,
+        cos: /^cost of sales/i,
+        expense: /^(expense|expenses|operating expenses)/i,
+        other: /^other (income|expense)/i
+      };
+      let section = null;
+      const totals = { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
+      const wageWords = /(wage|salary|salaries|super|superannuation)/i;
+      for (const line of lines) {
+        const cells = line.split(',').map((c) => c.replace(/^"|"$/g, '').trim());
+        if (cells.length < 2) continue;
+        const label = cells[0];
+        const amountCell = cells[cells.length - 1].replace(/[^0-9.\-]/g, '');
+        const amount = parseFloat(amountCell);
+        if (!label) continue;
+        if (sectionWords.income.test(label)) { section = 'income'; continue; }
+        if (sectionWords.cos.test(label)) { section = 'cos'; continue; }
+        if (sectionWords.expense.test(label)) { section = 'expense'; continue; }
+        if (sectionWords.other.test(label)) { section = null; continue; } /* Other Income/Expense excluded - not trading */
+        if (/^total\b/i.test(label)) continue; /* skip subtotal/total rows */
+        if (!isFinite(amount) || !section) continue;
+        if (section === 'income') totals.revenue += amount;
+        else if (section === 'cos') totals.cogs += amount;
+        else if (section === 'expense') {
+          if (wageWords.test(label)) totals.wagesSuper += amount;
+          else totals.overheads += amount;
+        }
       }
-      return { months, revenue, cogs, wagesSuper, overheads };
+      const today = new Date().toISOString().slice(0, 10);
+      return [{ date: today, ...totals }];
     }
   },
 
@@ -218,12 +190,82 @@ const ADAPTERS = {
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
+    /* Deputy, BARENZ's install: barenz.au.deputy.com. Verified against
+       developer.deputy.com at build time - permanent token (10yr life) via
+       the OAuth-clients screen, Resource API POST .../api/v1/resource/Roster/QUERY.
+       Re-check developer.deputy.com if this ever starts failing; Deputy does
+       shift endpoints around occasionally. */
+    configured: true,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
-    async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
+    _domain: 'barenz.au.deputy.com',
+
+    async _deputyFetch(env, path, init) {
+      const token = env.ROSTERING_API_TOKEN;
+      if (!token) throw new NotConfigured('rostering');
+      const res = await fetch('https://' + this._domain + path, {
+        ...init,
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          ...(init && init.headers)
+        }
+      });
+      if (!res.ok) throw new Error('Deputy ' + path + ' -> ' + res.status);
+      return await res.json();
+    },
+
+    /* Sums Roster.costTotal (rostered/projected labour cost) for one
+       inclusive date range, paginating past Deputy's 500-record page cap. */
+    async _sumCost(env, h, from, to) {
+      let start = 0, total = 0, guard = 0;
+      while (guard++ < 40) {
+        const page = await this._deputyFetch(env, '/api/v1/resource/Roster/QUERY', {
+          method: 'POST',
+          body: JSON.stringify({
+            search: {
+              s1: { field: 'Date', data: from, type: 'ge' },
+              s2: { field: 'Date', data: to, type: 'le' }
+            },
+            start, max: 500
+          })
+        });
+        const rows = Array.isArray(page) ? page : (page.data || []);
+        for (const r of rows) total += Number(r.costTotal || 0);
+        if (rows.length < 500) break;
+        start += 500;
+      }
+      return total;
+    },
+
+    async status(env, h) {
+      if (!env.ROSTERING_API_TOKEN) return { connected: false };
+      try {
+        const companies = await this._deputyFetch(env, '/api/v1/resource/Company/QUERY', {
+          method: 'POST', body: JSON.stringify({ max: 1 })
+        });
+        const rows = Array.isArray(companies) ? companies : (companies.data || []);
+        const name = rows[0] && (rows[0].CompanyName || rows[0].Name) || '';
+        return { connected: true, org: name, sandbox: /demo|test/i.test(name), lastSync: null };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+    async fetchRange(env, h, q) {
+      const cost = await this._sumCost(env, h, q.from, q.to);
+      return { cost };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const cost = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        cost.push(await this._sumCost(env, h, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0')));
+      }
+      return { months, cost };
+    }
   }
 };
 
