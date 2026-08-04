@@ -212,7 +212,11 @@ const ADAPTERS = {
           ...(init && init.headers)
         }
       });
-      if (!res.ok) throw new Error('Deputy ' + path + ' -> ' + res.status);
+      if (!res.ok) {
+        const e = new Error('Deputy ' + path + ' -> ' + res.status);
+        e.status = res.status;
+        throw e;
+      }
       return await res.json();
     },
 
@@ -241,16 +245,12 @@ const ADAPTERS = {
 
     async status(env, h) {
       if (!env.ROSTERING_API_TOKEN) return { connected: false };
-      try {
-        const companies = await this._deputyFetch(env, '/api/v1/resource/Company/QUERY', {
-          method: 'POST', body: JSON.stringify({ max: 1 })
-        });
-        const rows = Array.isArray(companies) ? companies : (companies.data || []);
-        const name = rows[0] && (rows[0].CompanyName || rows[0].Name) || '';
-        return { connected: true, org: name, sandbox: /demo|test/i.test(name), lastSync: null };
-      } catch (e) {
-        return { connected: false };
-      }
+      const companies = await this._deputyFetch(env, '/api/v1/resource/Company/QUERY', {
+        method: 'POST', body: JSON.stringify({ max: 1 })
+      });
+      const rows = Array.isArray(companies) ? companies : (companies.data || []);
+      const name = rows[0] && (rows[0].CompanyName || rows[0].Name) || '';
+      return { connected: true, org: name, sandbox: /demo|test/i.test(name), lastSync: null };
     },
     async fetchRange(env, h, q) {
       const cost = await this._sumCost(env, h, q.from, q.to);
