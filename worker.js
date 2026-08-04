@@ -223,7 +223,7 @@ const ADAPTERS = {
     /* Sums Roster.costTotal (rostered/projected labour cost) for one
        inclusive date range, paginating past Deputy's 500-record page cap. */
     async _sumCost(env, h, from, to) {
-      let start = 0, total = 0, guard = 0;
+      let start = 0, total = 0, guard = 0, rowsSeen = 0;
       while (guard++ < 40) {
         const page = await this._deputyFetch(env, '/api/v1/resource/Roster/QUERY', {
           method: 'POST',
@@ -236,11 +236,12 @@ const ADAPTERS = {
           })
         });
         const rows = Array.isArray(page) ? page : (page.data || []);
+        rowsSeen += rows.length;
         for (const r of rows) total += Number(r.costTotal || 0);
         if (rows.length < 500) break;
         start += 500;
       }
-      return total;
+      return { total, rowsSeen };
     },
 
     async status(env, h) {
@@ -253,8 +254,8 @@ const ADAPTERS = {
       return { connected: true, org: name, sandbox: /demo|test/i.test(name), lastSync: null };
     },
     async fetchRange(env, h, q) {
-      const cost = await this._sumCost(env, h, q.from, q.to);
-      return { cost };
+      const r = await this._sumCost(env, h, q.from, q.to);
+      return { cost: r.total, _debugRowsSeen: r.rowsSeen };
     },
     async fetchMonthly(env, h, q) {
       const months = monthList(q.fromMonth, q.toMonth);
@@ -262,7 +263,8 @@ const ADAPTERS = {
       for (const mo of months) {
         const [y, m] = mo.split('-').map(Number);
         const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-        cost.push(await this._sumCost(env, h, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0')));
+        const r = await this._sumCost(env, h, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
+        cost.push(r.total);
       }
       return { months, cost };
     }
